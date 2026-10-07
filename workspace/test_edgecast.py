@@ -600,6 +600,130 @@ class Case(unittest.TestCase):
                                      or e["data"].get("device"))
                             for e in south["events"]))
 
+    # ============================================ 同设备同包跨批次回执隔离 ==
+    def test_11_old_batch_receipt_not_recounted_in_new_batch(self):
+        """完成批次后立即为同设备同包开新批次：
+
+        - 旧批次已处理终态回执的重发必须返回**旧批次**的首次判定，
+          绝不落到新批次再次计票，也不改变新批次状态；
+        - 新批次自己（当前投放代次）的回执仍正常受理；
+        - 重启重放日志后结论保持。
+        """
+        b1 = self.new_batch(devices=("D1",), cap=1, threshold=1, retries=0)
+        first = self.send("D1", 1, "success")
+        self.assertTrue(first["terminal"])
+        self.assertEqual(self.eng.batch_view(b1)["status"], "completed")
+
+        # 立即创建同设备同包的新批次：首发代次跨批次延续为第 2 代
+        b2 = self.new_batch(devices=("D1",), cap=1, threshold=1, retries=0)
+        inflight = self.group(b2)["inflight"]
+        self.assertEqual([(x["device_id"], x["attempt"]) for x in inflight],
+                         [("D1", 2)])
+
+        # 重发旧批次（attempt=1）的终态回执：回旧批次首次判定
+        old = self.send("D1", 1, "success", attempt=1)
+        self.assertTrue(old["duplicate"])
+        self.assertTrue(old["idempotent"])
+        self.assertEqual(old["batch_id"], b1)
+        self.assertEqual(old["first_result"]["status"], "success")
+        v1, v2 = self.eng.batch_view(b1), self.eng.batch_view(b2)
+        self.assertEqual(v1["counts"]["succeeded"], 1)   # 旧票不增
+        self.assertEqual(v2["counts"]["succeeded"], 0)   # 新批次不被旧票计入
+        self.assertEqual(v2["devices"]["D1"]["votes"], 0)
+        self.assertEqual(v2["devices"]["D1"]["status"], "inflight")
+        self.assertEqual(self.inflight(b2), 1)
+
+        # 再次重发稳定返回同一首次判定，不产生任何新事件
+        before = len(self.eng.list_events(9999))
+        old2 = self.send("D1", 1, "success", attempt=1)
+        self.assertEqual(old2["batch_id"], b1)
+        self.assertTrue(old2["duplicate"])
+        self.assertEqual(len(self.eng.list_events(9999)), before)
+
+        # 新批次自己当前代次（attempt=2）的终态回执正常受理并完成
+        new = self.send("D1", 1, "success", attempt=2)
+        self.assertTrue(new["terminal"])
+        self.assertEqual(new["batch_id"], b2)
+        self.assertEqual(new["device_status"], "succeeded")
+        v2 = self.eng.batch_view(b2)
+        self.assertEqual(v2["status"], "completed")
+        self.assertEqual(v2["counts"]["succeeded"], 1)
+
+        # 重启重放日志后：旧回执仍回旧批次首次判定，两批次票数各为 1
+        self.reopen()
+        old3 = self.send("D1", 1, "success", attempt=1)
+        self.assertEqual(old3["batch_id"], b1)
+        self.assertTrue(old3["duplicate"])
+        self.assertEqual(self.eng.batch_view(b1)["counts"]["succeeded"], 1)
+        self.assertEqual(self.eng.batch_view(b2)["counts"]["succeeded"], 1)
+        # 新批次自己的回执重复也回新批次首次判定
+        new2 = self.send("D1", 1, "success", attempt=2)
+        self.assertEqual(new2["batch_id"], b2)
+        self.assertTrue(new2["duplicate"])
+
+    def test_11b_old_batch_replay_before_new_ack_isolates_state(self):
+        """新批次在飞期间先收到旧批次重发，再收新批次回执：状态不串。"""
+        b1 = self.new_batch(devices=("D1",), cap=1, threshold=1)
+        self.send("D1", 1, "success")
+        b2 = self.new_batch(devices=("D1",), cap=1, threshold=1)
+        new_attempt = self.group(b2)["inflight"][0]["attempt"]
+        self.assertEqual(new_attempt, 2)
+
+        # 旧批次终态重发（失败票也一样隔离）：用另一台设备走 failure 验证
+        b1f = self.new_batch(devices=("D2",), cap=1, threshold=1,
+                             package="MAP-F")
+        self.send("D2", 1, "failure", package="MAP-F")
+        b2f = self.new_batch(devices=("D2",), cap=1, threshold=1,
+                             package="MAP-F")
+        a2f = self.group(b2f)["inflight"][0]["attempt"]
+        old_f = self.send("D2", 1, "failure", attempt=1, package="MAP-F")
+        self.assertEqual(old_f["batch_id"], b1f)
+        self.assertTrue(old_f["duplicate"])
+        self.assertEqual(self.eng.batch_view(b2f)["counts"]["failed"], 0)
+        self.assertEqual(self.eng.batch_view(b2f)["devices"]["D2"]["status"],
+                         "inflight")
+        # 新批次失败回执正常计票
+        new_f = self.send("D2", 1, "failure", attempt=a2f, package="MAP-F")
+        self.assertEqual(new_f["batch_id"], b2f)
+        self.assertEqual(self.eng.batch_view(b2f)["counts"]["failed"], 1)
+
+    def test_11c_old_batch_replay_conflict_stays_on_old_batch(self):
+        """旧批次同序号不同正文的重放：永久冲突，且不改变新批次。"""
+        b1 = self.new_batch(devices=("D1",), cap=1, threshold=1)
+        self.send("D1", 1, "success")
+        b2 = self.new_batch(devices=("D1",), cap=1, threshold=1)
+        new_attempt = self.group(b2)["inflight"][0]["attempt"]
+        cf = self.send("D1", 1, "success", attempt=1, detail="篡改")
+        self.assertEqual(cf["rejection"]["code"], "EDGE_ACK_CONFLICT")
+        self.assertEqual(cf["batch_id"], b1)
+        self.assertEqual(self.eng.batch_view(b2)["counts"]["succeeded"], 0)
+        self.assertEqual(self.eng.batch_view(b2)["devices"]["D1"]["status"],
+                         "inflight")
+        # 新批次回执不受影响
+        self.assertTrue(
+            self.send("D1", 1, "success", attempt=new_attempt)["terminal"])
+
+    def test_11d_fresh_attempt_starts_at_one_for_other_device_package(self):
+        """跨批次延续只按 (设备, 包) 作用：其他设备/其他包首发仍是第 1 代。"""
+        ba = self.new_batch(devices=("D1",), cap=1, threshold=1,
+                            package="MAP-A")
+        self.send("D1", 1, "success", package="MAP-A")
+        self.assertEqual(self.eng.batch_view(ba)["status"], "completed")
+        # 同设备不同包：仍是第 1 代
+        bx = self.new_batch(devices=("D1",), cap=1, threshold=1,
+                            package="MAP-B")
+        self.assertEqual(self.group(bx)["inflight"][0]["attempt"], 1)
+        self.send("D1", 1, "success", package="MAP-B")
+        # 不同设备同包：仍是第 1 代
+        by = self.new_batch(devices=("D2",), cap=1, threshold=1,
+                            package="MAP-A")
+        self.assertEqual(self.group(by)["inflight"][0]["attempt"], 1)
+        self.send("D2", 1, "success", package="MAP-A")
+        # D1 对 MAP-A 的第二次投放（新批次）代次延续为 2
+        bz = self.new_batch(devices=("D1",), cap=1, threshold=1,
+                            package="MAP-A")
+        self.assertEqual(self.group(bz)["inflight"][0]["attempt"], 2)
+
     # ============================================================ 同源性 ====
     def test_10_cli_reads_same_log(self):
         bid = self.new_batch(devices=("D1", "D2"), cap=2, threshold=2)

@@ -6,8 +6,12 @@ EdgeCast — 边缘地图包分批投放编排器（事件溯源 / append-only �
 
 核心不变量
 ----------
-1. 回执按 (设备, 尝试代次 attempt, 序号 seq) **只处理一次**：
-   - 重复回执（正文摘要相同）永远返回首次结果（idempotent）；
+1. 回执按 (设备, 包, 尝试代次 attempt, 序号 seq) **只处理一次**：
+   - 尝试代次按 (设备, 包) **跨批次全局单调**：同一设备同一包的每个投放批次
+     从该设备上一代次之后继续编号，绝不在新批次重置为 1。这样不同批次的
+     回执命名空间天然不重叠；
+   - 重复回执（正文摘要相同）无论当前是否存在更新的开放批次，都返回**首次
+     判定所在批次**的首次结果（idempotent），绝不落到新批次再次计票；
    - 同号不同正文 → 永久拒绝 EDGE_ACK_CONFLICT；
    - 乱序回执先暂存（ack_buffered），所缺序号补齐后按序冲刷。
 2. 暂停 / 撤销 / 回执到达 / 超时同刻竞争，全部经单把锁串行化为**追加事件**：
@@ -15,7 +19,8 @@ EdgeCast — 边缘地图包分批投放编排器（事件溯源 / append-only �
 3. 超时设备进入该组待重试队列，由调度器在分组并发上限有空位时重投；
    任何时刻组内在飞数 ≤ 分组并发上限。重投递增 attempt，迟到的旧代次回执不能再计票。
 4. 崩溃恢复 = 重放 append-only JSONL 日志：队列、计数、时间窗、暂存回执、已投票状态
-   全部由事件折叠重建；继续投放不会重复计票（计票只发生在 ack_recorded 折叠中）。
+   与 (设备, 包) 跨批次尝试游标全部由事件折叠重建；继续投放不会重复计票（计票只发生
+   在 ack_recorded 折叠中）。
 5. 旧版本包（EDGE_OLD_PACKAGE）、未知设备（EDGE_UNKNOWN_DEVICE）、
    摘要校验失败（EDGE_ACK_CHECKSUM）一律拒绝并记录原因（ack_rejected 也进日志）。
 
@@ -214,7 +219,10 @@ class EdgeCastEngine:
         if etype == "device_registered":
             self.state["devices"].setdefault(d["device_id"], {
                 "device_id": d["device_id"], "group_hint": d.get("group_hint"),
-                "registered_at": ts})
+                "registered_at": ts,
+                # (设备, 包) 跨批次尝试游标：package_id -> 已投出的最大代次，
+                # 新批次首发从 last+1 继续（不在新批次重置为 1）。
+                "attempt_cursor": {}})
             return
 
         if etype == "batch_created":
@@ -241,6 +249,13 @@ class EdgeCastEngine:
                 "rejected": {}}
             dev["attempts_made"] = max(dev["attempts_made"], d["attempt"])
             dev["status"] = "inflight"
+            # (设备, 包) 跨批次全局尝试游标随每次投放单调推进；
+            # 由 dispatch_started 事件重建，重启后不回退。
+            gdev = self.state["devices"].setdefault(d["device"], {
+                "device_id": d["device"], "attempt_cursor": {}})
+            gdev.setdefault("attempt_cursor", {})
+            gdev["attempt_cursor"][b["package_id"]] = max(
+                gdev["attempt_cursor"].get(b["package_id"], 0), d["attempt"])
             dev.setdefault("history", []).append(
                 {"ts": ts, "event": "dispatch_started", "attempt": d["attempt"],
                  "source": src, "deadline": d["deadline"]})
@@ -309,14 +324,22 @@ class EdgeCastEngine:
             return
 
         if etype in ("ack_stale", "ack_decision"):
-            # 设备某代次某序号的"拒绝判定"也只做一次（旧代次迟到 / 撤销竞争落败等）
-            st = self._astate(b["devices"][d["device_id"]], d["attempt"])
+            # 设备某代次某序号的"拒绝判定"也只做一次（旧代次迟到 / 撤销竞争落败等）。
+            # 跨批次场景下，迟到回执携带的代次可能从未在**当前批次**投出（该代次
+            # 属于已完成的旧批次），此时没有对应序号空间，按需补一个仅用于记录
+            # 终身判定的空序号空间——它不参与投放/计票，只为重放恢复判定。
+            dev = b["devices"][d["device_id"]]
+            st = dev["attempt_state"].get(str(d["attempt"]))
+            if st is None:
+                st = {"expected_seq": 1, "processed": {}, "buffered": {},
+                      "rejected": {}}
+                dev["attempt_state"][str(d["attempt"])] = st
             st.setdefault("rejected", {})[str(d["seq"])] = {
                 "body_hash": d["body_hash"], "code": d["code"],
                 "message": d["message"], "at": ts,
                 "first_result": d.get("first_result")}
             self.state["rejects"].append(dict(d, ts=ts, kind=etype))
-            b["devices"][d["device_id"]]["history"].append(
+            dev["history"].append(
                 {"ts": ts, "event": etype, "code": d["code"],
                  "attempt": d["attempt"], "seq": d["seq"]})
             return
@@ -658,46 +681,75 @@ class EdgeCastEngine:
         return b
 
     # ================================================================ 回执 ==
-    def _dup_verdict(self, b: dict, payload: dict, body_hash: str):
-        """已关闭批次上查找同序号的首次判定；无记录返回 None。"""
+    def _verdict_in_batch(self, b: dict, payload: dict, body_hash: str):
+        """在**指定批次**内查找 (设备, attempt, seq) 的既有判定（纯查询，不落事件）。
+
+        返回 (kind, result)：
+          ("dup", result)    —— 已处理 / 已暂存（正文一致）→ 首次结果；
+          ("conflict", msg) —— 同序号已存在但正文摘要不同 → 需永久冲突拒绝；
+          (None, None)      —— 该批次内没有该序号的任何判定。
+        跨批次复用：旧批次回执重发时，即使当前有更新的开放批次，也必须回到
+        首次判定所在批次取结果。
+        """
         device_id = payload["device_id"]
         attempt, seq = payload["attempt"], payload["seq"]
         dev = b["devices"].get(device_id)
         if dev is None:
-            return None
+            return None, None
         ast = dev["attempt_state"].get(str(attempt))
         if ast is None:
-            return None
+            return None, None
         prev = ast["processed"].get(str(seq))
         if prev is not None:
             if prev["body_hash"] != body_hash:
-                return self._reject_receipt(
-                    payload, "EDGE_ACK_CONFLICT",
+                return "conflict", (
                     f"设备 {device_id} 第 {attempt} 代序号 {seq} 已处理过不同正文，"
-                    f"同号冲突，永久拒绝", batch_id=b["batch_id"])
-            return {"accepted": True, "idempotent": True, "duplicate": True,
-                    "batch_id": b["batch_id"], "device_id": device_id,
-                    "attempt": attempt, "seq": seq,
-                    "stale_attempt": attempt != dev["attempt"],
-                    "first_result": self._first_result(ast, str(seq))}
+                    f"同号冲突，永久拒绝")
+            return "dup", {
+                "accepted": True, "idempotent": True, "duplicate": True,
+                "batch_id": b["batch_id"], "device_id": device_id,
+                "attempt": attempt, "seq": seq,
+                "stale_attempt": attempt != dev["attempt"],
+                "first_result": self._first_result(ast, str(seq))}
         rej = ast.get("rejected", {}).get(str(seq))
         if rej is not None:
             if rej["body_hash"] != body_hash:
-                return self._reject_receipt(
-                    payload, "EDGE_ACK_CONFLICT",
+                return "conflict", (
                     f"设备 {device_id} 第 {attempt} 代序号 {seq} 曾以不同正文被拒"
-                    f"（{rej['code']}），同号冲突，永久拒绝", batch_id=b["batch_id"])
-            return {"accepted": False, "idempotent": True, "duplicate": True,
-                    "rejection": {"code": rej["code"], "message": rej["message"]},
-                    "batch_id": b["batch_id"], "device_id": device_id,
-                    "attempt": attempt, "seq": seq,
-                    "first_result": rej.get("first_result")}
+                    f"（{rej['code']}），同号冲突，永久拒绝")
+            return "dup", {
+                "accepted": False, "idempotent": True, "duplicate": True,
+                "rejection": {"code": rej["code"], "message": rej["message"]},
+                "batch_id": b["batch_id"], "device_id": device_id,
+                "attempt": attempt, "seq": seq,
+                "first_result": rej.get("first_result")}
         buf = ast["buffered"].get(str(seq))
         if buf is not None and buf["hash"] == body_hash:
-            return {"accepted": True, "idempotent": True, "duplicate": True,
-                    "buffered": True, "batch_id": b["batch_id"],
-                    "device_id": device_id, "attempt": attempt, "seq": seq,
-                    "first_result": {"buffered": True, "seq": seq}}
+            return "dup", {
+                "accepted": True, "idempotent": True, "duplicate": True,
+                "buffered": True, "batch_id": b["batch_id"],
+                "device_id": device_id, "attempt": attempt, "seq": seq,
+                "first_result": {"buffered": True, "seq": seq}}
+        return None, None
+
+    def _prior_verdict(self, matches: list, payload: dict, body_hash: str):
+        """在**所有同包同版本匹配批次**中解析 (设备, attempt, seq) 的首次判定。
+
+        关键：必须早于"当前开放批次"路由——完成旧批次后为同设备同包立即开新
+        批次时，旧批次终态回执的重发 (attempt 已被新批次超越) 仍要回到旧批次
+        返回其首次结果，而不是落入新批次再次计票。按批次创建顺序查找，命中
+        首个既有判定即返回。
+        """
+        for b in matches:
+            kind, res = self._verdict_in_batch(b, payload, body_hash)
+            if kind == "dup":
+                return res
+            if kind == "conflict":
+                # 首次判定是"冲突"：在该判定所在批次上补一条冲突记录，
+                # 返回的 batch_id 指向首次判定所在批次（而非开放新批次）。
+                return self._reject_receipt(
+                    payload, "EDGE_ACK_CONFLICT", res,
+                    batch_id=b["batch_id"])
         return None
 
     def ingest_receipt(self, body: dict) -> dict:
@@ -709,7 +761,8 @@ class EdgeCastEngine:
 
             device_id = payload["device_id"]
             package_id = payload["package_id"]
-            # 先找该设备针对该包的批次（含已完成/已撤销——重复回执仍需回首次结果）
+            # 该设备针对该包的**所有**批次（含已完成/已撤销——旧批次回执重发
+            # 仍需回到其首次判定所在批次取结果），按批次创建顺序排列。
             matches = [x for x in self.state["batches"].values()
                        if x["package_id"] == package_id and device_id in x["devices"]]
             target = self._open_batch_for(device_id, package_id) or \
@@ -719,8 +772,6 @@ class EdgeCastEngine:
                     payload, "EDGE_NO_OPEN_BATCH",
                     f"设备 {device_id} 没有针对包 {package_id} 的投放批次")
             b = target
-            payload["batch_id"] = b["batch_id"]
-            dev = b["devices"][device_id]
             attempt, seq = payload["attempt"], payload["seq"]
             body_hash = receipt_hash(payload)
 
@@ -738,13 +789,20 @@ class EdgeCastEngine:
                     f"回执版本 {payload['package_version']} 与批次版本 "
                     f"{b['package_version']} 不一致", batch_id=b["batch_id"])
 
-            # 2) 已处理 / 已判定拒绝的回执，无论批次状态 / 代次新旧，重复即返回
-            #    首次结果；同号不同正文永久冲突（必须早于批次状态闸门）。
-            dup = self._dup_verdict(b, payload, body_hash)
-            if dup is not None:
-                return dup
+            # 2) 跨批次既有判定（必须早于"当前开放批次"路由与批次状态/代次闸门）：
+            #    完成旧批次后立即为同设备同包开新批次时，旧批次已处理回执的重发
+            #    (其代次已被新批次的全局代次超越) 必须回到首次判定所在批次返回
+            #    首次结果，绝不落到新批次再次计票；同号不同正文永久冲突。
+            #    只在同版本批次内查找（版本闸门已过，命名空间以版本为界）。
+            same_version = [x for x in matches
+                            if x["package_version"] == payload["package_version"]]
+            prior = self._prior_verdict(same_version, payload, body_hash)
+            if prior is not None:
+                return prior
 
-            # 3) 非首次回执才受批次状态约束
+            # 3) 非首次回执才受当前批次状态约束
+            payload["batch_id"] = b["batch_id"]
+            dev = b["devices"][device_id]
             if b["revoked"] or b["closed"]:
                 code = "EDGE_BATCH_REVOKED" if b["revoked"] else "EDGE_BATCH_CLOSED"
                 return self._decision_reject(
@@ -1022,7 +1080,14 @@ class EdgeCastEngine:
                         r["device"], "retry", r["attempt"] + 1
                 elif g["pending"]:
                     candidate = g["pending"][0]
-                    source, attempt = "pending", 1
+                    source = "pending"
+                    # 首发代次按 (设备, 包) 跨批次延续：本批次是该设备针对
+                    # 该包的新一轮投放，从历史最大代次 +1 开始，保证不同批次的
+                    # (attempt, seq) 回执命名空间永不重叠。
+                    gdev = self.state["devices"].get(candidate, {})
+                    cursor = gdev.get("attempt_cursor", {}).get(
+                        b["package_id"], 0)
+                    attempt = max(1, cursor + 1)
                 if candidate is None:
                     break
                 deadline = now + timedelta(seconds=b["timeout_sec"])
