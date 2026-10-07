@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EdgeCast · 边缘地图包分批投放编排器</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header>
+  <h1>📡 EdgeCast <small>边缘地图包分批投放编排器</small></h1>
+  <div class="conn"><span id="conn-dot" class="dot"></span><span id="conn-text">连接中…</span>
+    <span class="now" id="now"></span></div>
+</header>
+
+<nav class="tabs">
+  <button data-tab="batches" class="active">📦 投放批次</button>
+  <button data-tab="create">➕ 创建批次</button>
+  <button data-tab="receipt">🛰️ 回执入口</button>
+  <button data-tab="rejects">🚫 拒绝记录</button>
+  <button data-tab="events">🧾 事件流</button>
+</nav>
+
+<main>
+  <!-- 批次看板 -->
+  <section id="tab-batches" class="tab active">
+    <div id="batch-cards" class="cards"></div>
+    <div id="batch-detail" class="detail hidden"></div>
+  </section>
+
+  <!-- 创建批次 -->
+  <section id="tab-create" class="tab">
+    <div class="panel">
+      <h2>创建投放批次</h2>
+      <div class="form-row">
+        <label>包 ID<input id="f-pkg" value="MAP-EDGE-A"></label>
+        <label>包版本<input id="f-ver" value="1.0.0"></label>
+        <label>时间窗（秒）<input id="f-window" type="number" value="300"></label>
+      </div>
+      <div class="form-row">
+        <label>单设备超时（秒）<input id="f-timeout" type="number" value="15"></label>
+        <label>最大重试次数<input id="f-retries" type="number" value="2"></label>
+        <label>重试退避（秒）<input id="f-retry-delay" type="number" value="1"></label>
+      </div>
+      <div class="form-row">
+        <label>阈值模式
+          <select id="f-thr-mode">
+            <option value="count">成功设备数</option>
+            <option value="ratio">成功比例</option>
+          </select>
+        </label>
+        <label>回执阈值<input id="f-threshold" type="number" value="1"></label>
+        <label>备注<input id="f-note" value="晚高峰边缘地图包"></label>
+      </div>
+      <h3>设备分组 <button class="mini" id="btn-add-group">+ 添加分组</button></h3>
+      <div id="groups-editor"></div>
+      <button class="primary" id="btn-create">创建批次</button>
+      <pre id="create-result" class="result"></pre>
+    </div>
+  </section>
+
+  <!-- 回执入口 -->
+  <section id="tab-receipt" class="tab">
+    <div class="panel">
+      <h2>设备回执独立入口 <small>POST /api/edgecast/receipts</small></h2>
+      <div class="form-row">
+        <label>设备序号<input id="r-device" value="D1"></label>
+        <label>包 ID<input id="r-pkg" value="MAP-EDGE-A"></label>
+        <label>包版本<input id="r-ver" value="1.0.0"></label>
+      </div>
+      <div class="form-row">
+        <label>尝试代次 attempt<input id="r-attempt" type="number" value="1"></label>
+        <label>回执序号 seq（每代从 1 起）<input id="r-seq" type="number" value="1"></label>
+        <label>状态
+          <select id="r-status">
+            <option>received</option>
+            <option>installed</option>
+            <option value="success" selected>success（终态成功）</option>
+            <option value="failure">failure（终态失败）</option>
+          </select>
+        </label>
+      </div>
+      <div class="form-row">
+        <label class="grow">正文 detail<input id="r-detail" value=""></label>
+        <label class="check"><input id="r-bad" type="checkbox"> 篡改摘要（演示校验失败）</label>
+        <label class="check"><input id="r-old" type="checkbox"> 伪装旧版本 0.9.0</label>
+      </div>
+      <button class="primary" id="btn-send-receipt">提交回执</button>
+      <pre id="receipt-result" class="result"></pre>
+      <p class="hint">同设备同代次同序号的重复回执返回首次结果；乱序回执先暂存；
+        同号不同正文永久拒绝（EDGE_ACK_CONFLICT）。</p>
+    </div>
+  </section>
+
+  <!-- 拒绝记录 -->
+  <section id="tab-rejects" class="tab">
+    <div class="panel"><h2>拒绝记录（旧包 / 未知设备 / 摘要失败 / 冲突 / 旧代次）</h2>
+      <table id="rejects-table"><thead><tr>
+        <th>时间</th><th>类型</th><th>原因码</th><th>设备</th><th>代次#序号</th><th>说明</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <!-- 事件流 -->
+  <section id="tab-events" class="tab">
+    <div class="panel"><h2>追加事件流（append-only，崩溃即从此恢复）</h2>
+      <div id="events-log" class="eventlog"></div>
+    </div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

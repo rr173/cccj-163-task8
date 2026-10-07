@@ -1,0 +1,449 @@
+# 高精地图瓦片 · 分区发布与车辆路线快照服务
+
+零第三方依赖（Python 3.11 标准库 + 原生 HTML/JS），实现"地图编辑 → 接缝/跨区路线验证
+→ 按区域代际发布 → 车辆路线快照固定 → 紧急补丁安全过渡 → 离线追赶"的完整闭环，
+并附带三个物理隔离的子系统：**监管时序审计**（只读线上）、
+**路侧计算盒地图镜像仓库**（不可变清单 → 压缩块拉取 → 验真暂存 → 原子换指针）与
+**容量感知预热编排**（站点共享带宽 + 盒内空间 + 内容复用的批量传输调度）。
+
+## 启动
+
+```bash
+python3 server.py 8080          # 打开 http://localhost:8080
+```
+
+首次启动会自动生成演示世界并落盘到 `data/mapstate.json`（原子写）。
+首次使用审计功能会自动创建独立的 `data/audit.json`（append-only）。
+首次使用镜像分发会自动创建独立的 `data/mirror.json`（原子写）。
+首次使用预热编排会自动创建独立的 `data/preheat.json`（原子写）。
+删除 `data/` 即可重置。命令行工具 `route_replay.py` / `audit_cli.py` / `mirror_cli.py` /
+`preheat_cli.py` 直接读写各自存储，无需开服务（`audit_cli.py`、`mirror_cli.py`
+与 `preheat_cli.py` 对线上存储只读）。
+
+**边缘地图包分批投放编排器（EdgeCast）** 是独立服务（append-only 事件日志
+`data/edgecast/events.log`，自成一域，不触碰上述存储）：
+
+```bash
+python3 edgecast_server.py 8090          # 打开 http://localhost:8090/edgecast/
+```
+
+详见 [EDGECAST_README.md](EDGECAST_README.md)；命令行 `edgecast_cli.py`、
+一键演示 `bash demo_edgecast.sh`、验收 `python3 test_edgecast.py`。
+
+## 领域模型与不变量
+
+| 概念 | 说明 |
+|---|---|
+| 瓦片 `tile` | 内容以 sha256 寻址、入库即不可变；含节点、车道规则、跨瓦片端口（拓扑边界）、bounds |
+| 区域 `region` | 发布分区（演示为 north / south）；每个区域维护单调递增的 `generation` |
+| 候选 `candidate` | 编辑器产出，绑定**基线代际**；发布前必须通过接缝与跨区走廊校验 |
+| 发布 `release` | 按区域代际推进、原子提交；多区域发布要么全成要么全无；发布失败不产生任何新版本 |
+| 有效版本 | `north=N/south=M+P-xxxx[p优先级]…`，其描述符再做一次 sha256（descriptor_hash） |
+| 补丁 `patch` | **纯规则叠加**（只能封闭既有车道），固化基础版本瓦片哈希；不含几何/拓扑增删 |
+| 快照 `snapshot` | 车辆取路线时固定"版本描述符 + 瓦片哈希集合 + 逐边路径"，永不被后续发布/补丁改写 |
+| 试运行批次 `rollout` | 从**校验通过**的候选创建：作用区域 + 车辆名单 + 观察窗口；名单内新行程用待晋级内容，名单外读当前内容 |
+| 清单 `manifest` | 发布人员选定**已生效快照**（当前生效版本或已固定行程快照）+ 设备集合生成的**不可变**分发清单；对象（版本描述符 + 瓦片）打包为 zlib 压缩块，逐块 sha256、整包根散列；内容寻址，重试生成返回首次清单 |
+| 镜像任务 `task` | 清单 × 盒子的分发任务：`pulling 拉取中 → ready 可切换 → active 已切换`，或 `failed / rejected`；判定一次终身，重试返回首次结果 |
+| 路侧盒 `device` | 计算盒：`current_image`（当前镜像指针）+ 至多一个待切换任务；只在全部对象验真后原子换指针 |
+| 站点 `site` | 预热编排的共享带宽域：同站点盒子的授予速率之和永不超过站点容量（KB/s） |
+| 预热作业 `job` | 调度员为一批目标盒提交：`清单 + 截止时间 + 链路速率上限 + 最小在线保障`；相同内容重复提交返回首次作业（已取消则确定性新建） |
+| 传输任务 `PT-xxxx` | 作业 × 盒子：`queued 排队 / transferring 传输中 / transferred 待验收 / quarantined 隔离中 / proven(=done) 已证明 / paused 暂停 / canceled 取消`；磁盘预留与传输名额**成对**取得与释放 |
+| 盒端验收 `AR-xxxx` | 传输完成后盒端对清单对象逐项验证**长度 · 对象散列 · 块散列 · 根散列**；每次验收追加带**清单代次、作业编号、盒内验收序号**的链式不可变证明；只有证明有效的对象进入盒上已证明地图与**可切换集合**，并作为后续复用的唯一来源 |
+| 修复任务 `PR-xxxx` | 验收缺块/损坏时只隔离受影响对象、释放其对应空间后，按**剩余块**创建一次修复（已证明对象不重传）；修复键 `(任务,隔离代次,块集合)` 并发提交返回首次任务；旧代次修复完成也不覆盖新代次证明（`superseded`） |
+| 欠账 `debt` | 合格却未获足额带宽的任务每 tick 累计欠账（未达最小在线保障的作业双倍），调度按欠账优先——持续推进的作业不会饿死；欠账落盘，重启后保留 |
+
+**接缝校验**（候选发布闸门）：端口相互声明、全局坐标重合、限速/车道数 profile 一致、
+无孤立端口，外加区域瓦片完整性（必须重述本区全部瓦片）与全部跨区验收走廊可贯通。
+
+**新旧拓扑绝不拼接**：在途快照的 descriptor_hash 与瓦片集合恒定；途中有新封路时只发预警。
+车辆在车道上（`on_lane`）请求过渡会被拒绝；必须先完成当前车道、到达节点（`at_node`），
+才能切换到基于当前版本重算的**子快照**（父子链可审计）。
+
+**补丁安全**：生成时即在"基础版本+封闭叠加"图上验证每条封闭车道仍存在节点间绕行；
+激活前再次核对基础瓦片哈希（漂移则拒绝）、兼容性结论与重复封闭。无绕行的补丁标记
+`incompatible` 且无法激活。撤销只影响新路线；历史快照仍按其固定补丁复算。
+
+**离线追赶**：车辆带最后确认事件号重连，服务回放全部错过事件，给出唯一当前版本与
+在途快照预警；同步本身幂等（事件检查点持久化）。
+
+**分组试运行**：批次把名单车辆的**新行程**分流到候选的待晋级内容（版本描述带
+`~RO-xxxx` 后缀，区域代际不动），其余车辆仍读当前发布内容；每个批次按
+`试运行组/对照组` 累计请求量、不可达次数与安全过渡拒绝。任一区域同时只允许一个
+进行中批次（`ROLLOUT_REGION_CONFLICT`）；晋级即走正常原子发布（基线漂移→409，
+校验失败→422，绝不留下部分区域切换），阈值越界禁止晋级（`ROLLOUT_THRESHOLD_BREACH`）；
+晋级/撤回一次性生效，重复调用返回首次结果（`idempotent:true`），反向操作→409。
+撤回只停止新的分流：已发出的行程快照与区域代际原样保留。批次与统计随
+`mapstate.json` 原子落盘，重启后完整恢复。
+
+**镜像分发**（路侧计算盒）：清单内容寻址、生成即不可变；设备代理逐块校验
+`sha256(压缩块)`，最后一块确认时复核**整包根散列**才把镜像标记为"可切换"（暂存）。
+断网续拉从已确认块之后继续，**已确认块不重复计数**（确认幂等）。同一盒子只允许一个
+待切换镜像（`MIRROR_PENDING_CONFLICT`）；清单任一代次落后于当前镜像、或版本相同、
+或同代次的更早发布，都被拒绝（`MIRROR_STALE_GENERATION`）；仓库对象损坏
+（`MIRROR_OBJECT_CORRUPT`）或根散列不符（`MIRROR_ROOT_HASH_MISMATCH`）则任务失败——
+以上任何失败都**不触碰盒子当前镜像**。切换即一次原子提交内的换指针（镜像 + 任务状态 +
+处理记录同生共死），切换前任务保持原状态。任务状态、逐次处理记录（journal）与切换结果
+全部落盘 `data/mirror.json`，重启后拉取中/可切换/已切换/失败/拒绝均可辨别。
+网页与 `mirror_cli.py` 读写同一存储，进度与拒绝理由完全一致；镜像子系统只读线上，
+绝不改动地图中心状态与已创建行程快照。
+
+**预热编排**（容量感知，只读线上与镜像仓库）：调度员按`截止时间 · 链路速率上限 ·
+最小在线保障`为一批目标盒提交作业，调度器按**站点共享带宽、盒内可用空间、内容复用率**
+安排传输。磁盘预留与传输名额**成对取得/释放**——空间不足（`BOX_DISK_FULL`）、
+链路降级（`LINK_DOWN`/`BOX_LINK`）、盒子离线（`BOX_OFFLINE`）、暂停、取消或服务崩溃
+都会成对让路，绝不留下幽灵占用；占用量由任务状态**派生**，每次原子提交内重算调度，
+并发操作不会突破站点总带宽或盒内空间。合格却未获带宽的任务按 tick 累计**欠账**
+（未达最小在线保障的作业双倍），调度按（欠账↓ · 截止↑ · 提交序↑）服务，
+持续推进的作业不会长期饿死；暂停后恢复只补剩余数据（已传字节不回退）。
+服务重启时传输中任务的预留成对释放、重新排队，队列/欠账/剩余时长从
+`data/preheat.json` 完整重建。修改配额、取消（判定一次终身）与再次提交
+（相同内容返回首次作业，已取消则新建）都是确定结果；网页与 `preheat_cli.py`
+展示**相同的排队次序、限速原因与预计完成时间**（同一存储 + 同一纯调度函数），
+调度页与命令行也从同一状态展示**待验收 / 已证明 / 隔离 / 修复中**看板与
+按站点×清单的通过率、隔离容量、失败原因汇总。编排时钟为落盘的模拟时钟（`tick` 推进），预计完成时间由确定性仿真给出；
+最小在线保障预计无法按时达成时给出预警。
+
+**盒端验收与隔离修复**：传输完成只代表"已到盒"，不代表可信。每台盒子随后对
+清单对象逐项验证长度、对象散列、压缩块散列与整包根散列；每次验收（run）追加
+不可变记录与逐对象证明，携带清单代次、作业编号和**盒内单调验收序号**，证明按
+`parent_digest` 串链，写入后永不改变原清单、已生效地图或行程快照。验收通过的
+对象才进入盒上"已证明对象地图"并计入后续复用与**可切换集合**；验收发现缺块或
+损坏时**只隔离受影响对象**（按块隔离、释放该块空间，其他对象的证明保留），
+随后按隔离对象所在的**剩余块创建恰好一次修复**——已证明对象绝不重传。修复键
+`(任务, 隔离代次, 块集合)` 的并发提交返回首次任务；修复完成自动重新验收，
+**旧代次修复永远不能覆盖新代次证明**（父任务已进入更新代次时旧修复立即标记
+`superseded`）。盒子离线、服务重启（修复中任务成对释放后重新排队）或修复取消
+（隔离保留、可按同键确定性续作）后都能继续或收敛，且不残留任何容量占用
+（容量账按盒上块持有记录去重取得/释放，`check_invariants` 可自检）。
+每次验收与修复都有确定、可追溯的结果（原因码 / 释放字节 / 收敛证明）。
+
+编排子系统只读线上与镜像清单，
+绝不改动已生效地图、行程快照与镜像仓库（缺陷注入只改盒端暂存副本）。
+
+## API（均为 JSON，前缀 `/api`）
+
+### 线上运维 API
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| GET | `/status` | 区域代际/head/当前版本/活动补丁 |
+| GET | `/tiles` · POST `/tiles` | 瓦片清单 · 导入（内容寻址，重复幂等） |
+| GET/POST | `/candidates` | 候选列表 · 创建候选 `{regions, tiles:[{tile_id,hash}]}` |
+| POST | `/candidates/{id}/validate` | 接缝+跨区走廊校验 |
+| POST | `/candidates/{id}/publish` | 按区域代发布（基线过期→409，校验失败→422 原子拒绝） |
+| GET | `/releases` · `/corridors` · `/events` | 发布史/验收走廊/审计日志 |
+| GET/POST | `/patches` | 补丁队列 · 创建（自动兼容性+绕行校验） |
+| POST | `/patches/{id}/activate` · `/revoke` | 生效（复核基础哈希）· 撤销 |
+| POST | `/routes` | `{vehicle_id, from_node, to_node}` → 固定快照（201） |
+| GET | `/snapshots` · `/snapshots/{id}` | 快照清单 · 完整复现载荷（含 tile 内容/预警） |
+| POST | `/snapshots/{id}/progress` | 上报 `{step, state: at_node|on_lane}` |
+| POST | `/snapshots/{id}/adopt-reroute` | **仅 at_node** 可过渡到绕行子快照 |
+| POST | `/snapshots/{id}/complete` | 完成行程 |
+| GET | `/vehicles/{id}` · `/vehicles/{id}/sync?last_event_id=N` | 车辆快照链 · 离线追赶 |
+| GET | `/view?mode=published\|candidate\|snapshot&ref=` | 审查页地图数据（瓦片/接缝/走廊/路线） |
+| GET/POST | `/rollouts` | 批次清单（含分组统计/阈值判定）· 创建批次 `{candidate_id, regions, vehicles, window?, thresholds?}` |
+| GET | `/rollouts/{id}` | 批次详情（各组请求量/不可达/安全过渡拒绝） |
+| POST | `/rollouts/{id}/promote` · `/rollback` | 按阈值一次性晋级（原子发布）· 撤回；重复调用返回首次结果 |
+
+### 路侧盒镜像 API（只读线上；只写独立的 `data/mirror.json`）
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| GET/POST | `/mirror/manifests` | 清单列表 · 生成不可变清单并分发 `{devices, note?, source?}`（相同内容幂等返回首次清单与任务） |
+| GET | `/mirror/manifests/{id}` · POST `/mirror/manifests/{id}/dispatch` | 清单详情 · 追加分发到更多盒子（逐盒判定一次终身） |
+| GET | `/mirror/tasks?device=` · `/mirror/tasks/{id}` | 任务进度/拒绝理由/处理记录（与设备 CLI 同一数据源） |
+| GET | `/mirror/tasks/{id}/chunks/{n}` | 设备拉取压缩对象块（zlib，含声明散列） |
+| POST | `/mirror/tasks/{id}/chunks/{n}/ack` | 按设备算得的散列确认块（幂等，不重复计数；坏散列记录拒绝理由） |
+| POST | `/mirror/tasks/{id}/switch` | 全部对象验真后原子换指针（重复调用返回首次切换结果） |
+| POST | `/mirror/tasks/{id}/agent` | 设备代理模拟 `{stop_after?, corrupt_chunk?}`：断网续拉/传输损坏演示 |
+| GET | `/mirror/devices` · `/mirror/devices/{id}` · `/mirror/events` | 盒子当前镜像与待切换任务 · 镜像仓库事件流 |
+
+**拒绝码**：`MIRROR_PENDING_CONFLICT`（盒子已有待切换镜像）、
+`MIRROR_STALE_GENERATION`（较老代次/同版本/同代次更早发布）、
+`MIRROR_CHUNK_HASH_MISMATCH`（块散列不符，可重试）、
+`MIRROR_OBJECT_CORRUPT`（仓库对象损坏，任务失败）、
+`MIRROR_ROOT_HASH_MISMATCH`（整包根散列不符）、
+`MIRROR_NOT_READY`（未验真完毕禁止切换）、`MIRROR_TASK_CLOSED`（任务已终结）、
+`MIRROR_CHUNK_UNKNOWN`（块不存在）、`MIRROR_SOURCE_NOT_FOUND`（来源快照不存在）。
+
+### 容量感知预热编排 API（只读线上与镜像；只写独立的 `data/preheat.json`）
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| GET/POST | `/preheat/sites` · POST `/preheat/sites/{id}/capacity` | 站点清单 · 注册/调整共享带宽（确定性抢占） |
+| GET/POST | `/preheat/boxes` · POST `/preheat/boxes/{id}/link` · `/online` | 盒子清单 · 注册 · 链路降级/恢复 · 上下线 |
+| GET/POST | `/preheat/jobs` · GET `/preheat/jobs/{id}` | 作业清单 · 提交 `{manifest_id, targets, deadline_in_sec, link_cap_kbps, min_online}`（重复提交返回首次作业） |
+| POST | `/preheat/jobs/{id}/pause` · `/resume` · `/cancel` | 暂停（成对释放）· 恢复（只补剩余）· 取消（判定一次终身） |
+| GET | `/preheat/queue` | 调度队列：次序/速率/限速原因/预计完成（与 CLI 同一数据源） |
+| POST | `/preheat/tick` | 推进模拟时钟 `{seconds}`（传输前进、欠账累计；修复完成自动重新验收） |
+| GET | `/preheat/events` | 编排事件流（append-only） |
+
+### 盒端验收与隔离修复 API（同一 `data/preheat.json`；只读线上与镜像）
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| POST | `/preheat/tasks/{id}/accept` | 盒端逐项验收（长度/对象散列/块散列/根散列），追加不可变证明；损坏则隔离并创建唯一修复；已证明任务重复验收返回首次证明 |
+| POST | `/preheat/tasks/{id}/corrupt` | 盒端缺陷演示 `{mode: chunk\|object\|length\|missing, chunk?, object_id?}`（只改盒端暂存，镜像清单/已生效地图不变） |
+| POST | `/preheat/tasks/{id}/repair` | 为隔离中的任务创建/返回唯一修复（同键并发返回首次任务；取消后再提交为新尝试） |
+| POST | `/preheat/repairs/{id}/cancel` | 取消修复（成对释放、隔离保留、可续作；重复返回首次结果） |
+| GET | `/preheat/acceptance?box=` | 验收看板：**待验收 / 已证明 / 隔离 / 修复中**（网页与 CLI 同一状态） |
+| GET | `/preheat/acceptance/runs?box=&task=` | 不可变验收记录（清单代次/作业/序号/逐对象结果/证明摘要链） |
+| GET | `/preheat/acceptance/summary?site=&manifest=` | 按**站点 × 清单**汇总任务/对象通过率、隔离容量、失败原因、修复统计 |
+| GET | `/preheat/repairs?task=&box=` | 修复清单：排队/传输/完成/取消/旧代次失效的确定结果 |
+
+**验收原因码**：`ACCEPT_OBJECT_LENGTH`（对象长度不符）、
+`ACCEPT_OBJECT_HASH`（对象内容散列不符）、`ACCEPT_CHUNK_MISSING`（缺块）、
+`ACCEPT_CHUNK_HASH`（压缩块散列不符）、`ACCEPT_ROOT_HASH`（根散列不符）。
+**拒绝码**：`ACCEPT_NOT_DELIVERED`（传输未完成不可验收）、
+`ACCEPT_RUN_UNKNOWN`、`REPAIR_UNKNOWN`、`REPAIR_NOT_QUARANTINED`、
+`REPAIR_NOT_NEEDED`、`PREHEAT_TASK_UNKNOWN`、`PREHEAT_TASK_CLOSED`。
+
+**限速/排队原因码**：`JOB_CAP`（作业速率上限）、`BOX_LINK`（盒链路降级）、
+`SITE_SHARED`（受站点共享带宽限制）、`SITE_SATURATED`（站点被更高欠账作业占满）、
+`BOX_DISK_FULL`（盒内空间不足）、`BOX_OFFLINE`（盒子离线）、`LINK_DOWN`（链路为 0）、
+`PAUSED`（作业暂停）。**拒绝码**：`PREHEAT_MANIFEST_UNKNOWN`、`PREHEAT_BOX_UNKNOWN`、
+`PREHEAT_SITE_UNKNOWN`、`PREHEAT_JOB_UNKNOWN`、`PREHEAT_JOB_CLOSED`、`PREHEAT_NO_TARGETS`。
+
+### 监管审计 API（只读线上；只写独立的 `data/audit.json`）
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| POST | `/audit/template` | **只读**：按当前线上版本生成一份正确签名的样例证据链（不写档案） |
+| POST | `/audit/vehicle-events` | **只读**：把某台线上车辆的快照链签名成可导入事件 |
+| POST | `/audit/imports` | 导入证据链 `{import_key, events}`；首次判定，201 通过 / 422 拒绝 |
+| GET | `/audit/imports` · `/audit/imports/{key}` | 导入清单 · 链详情（逐条事件摘要） |
+| POST | `/audit/imports/{key}/append` | 长序列从持久头部检查点续算（坏批次不污染原链） |
+| POST | `/audit/imports/{key}/checkpoints` | 审计员确认检查点 `{seq, note}` |
+| GET | `/audit/imports/{key}/checkpoints` · `/branches` | 检查点清单 · 隔离分支清单 |
+| POST/GET | `/audit/imports/{key}/query` | 按 `seq` 或 `ts` 重建时刻空间状态 |
+| POST | `/audit/imports/{key}/branches` | 从**已确认**检查点建分支：`version_switch` 或 `revoke_closure` |
+| GET | `/audit/branches/{id}` | 分支完整演算结果（含 what-if 地图） |
+| GET/POST | `/audit/exports` | 导出审计证据包（事件+检查点+分支+bundle 摘要） |
+| GET | `/audit/archives` | append-only 审计档案流（查询/分支/确认/导出/续算全部留痕） |
+
+**证据事件**：`{seq, ts, source, type, payload, parent_digest, digest}`，
+`digest = sha256(规范化{seq,ts,source,type,payload,parent_digest})`。
+类型 `route_pinned / progress / reroute_adopted / trip_completed`。
+
+**拒绝码**：`AUDIT_SEQ_GAP`（序号跳跃）、`AUDIT_DUPLICATE_EVENT`（重复事件）、
+`AUDIT_DIGEST_MISMATCH`（摘要被改写）、`AUDIT_PARENT_MISSING`（父事件/父路线缺失），
+以及 `AUDIT_CHECKPOINT_NOT_CONFIRMED`（分支点未确认）、`AUDIT_PATCH_NOT_PINNED`
+（撤销的管制不在该时刻版本中）。同一 `import_key` 永远返回首次判定
+（响应带 `idempotent:true`）。重建时还会逐瓦片复核内容摘要、重算版本描述哈希。
+
+## 页面
+
+- **🗺️ 地图审查**：区域代际表、候选卡片（一键校验/发布）、SVG 拓扑图（接缝绿/红点、
+  跨区走廊绿线）、结构化校验报告、发布时间线。
+- **🚨 封路补丁**：勾选车道生成补丁（自动给出兼容/不兼容与绕行），激活/撤销。
+- **🚗 路线复现**：请求路线、模拟"进入车道/到达节点"、封路预警、节点处安全过渡、
+  行程完成、离线追赶事件回放。
+- **🧪 分组试运行**：从校验通过的候选创建批次（作用区域/对象名单/观察窗口/阈值），
+  实时监控各组请求量、不可达次数与安全过渡拒绝；阈值越界禁止晋级，
+  一键晋级（原子发布）或撤回（不动快照与代际），重复操作返回首次结果。
+- **📦 镜像分发**：选定已生效快照（当前版本/行程快照）+ 设备集合生成不可变清单；
+  盒子卡片实时显示当前镜像与待切换任务进度条，一键模拟拉取/断网/传输损坏、
+  原子换指针；拒绝理由与处理记录和设备 CLI 同源。
+- **🔥 预热编排**：注册站点共享带宽与盒子容量（磁盘/链路），按截止时间、链路上限与
+  最小在线保障提交批量预热；实时队列展示排队次序、欠账、限速原因与预计完成时间，
+  一键推进时钟/链路降级/上下线/暂停/恢复/取消；全部操作与 `preheat_cli.py` 同源。
+  作业传输完成后在**盒端验收与隔离修复**面板一键执行逐项验收（长度/对象散列/块散列/
+  根散列）并查看不可变证明，可注入块损坏/对象损坏/长度不符/缺块演示；看板同一状态
+  展示待验收、已证明、隔离与修复中，修复自动按剩余块重拉、同键并发只认首次、旧代次
+  修复不覆盖新证明；右侧按站点×清单汇总通过率、隔离容量与失败原因。
+- **⚖ 时序审计**（只读）：导入带序号/来源/摘要校验的车辆运行事件；在地图上重建
+  指定事件序号（或时刻）的空间状态——版本描述、瓦片摘要、行驶步骤、当前位置；
+  从已确认检查点一键隔离演算"版本切换"或"撤销道路管制"；导出审计证据包。
+  查询/分支/导出只追加审计档案，绝不改动线上。
+
+## CLI：route_replay.py
+
+```bash
+./route_replay.py status
+./route_replay.py plan VH-01 A00/w B01/e          # 固定快照
+./route_replay.py replay S-0001                   # 确定性逐边复现（含版本哈希/瓦片哈希）
+./route_replay.py progress S-0001 1 at_node
+./route_replay.py advisory S-0001
+./route_replay.py adopt-reroute S-0001
+./route_replay.py patch A00 lce "事故封路" 100
+./route_replay.py activate P-0001
+./route_replay.py revoke P-0001 "管制解除"
+./route_replay.py validate RC-0003
+./route_replay.py publish RC-0002
+./route_replay.py sync VH-02 0
+./route_replay.py rollout-new RC-0002 north VH-01,VH-03 30 0 0   # 候选/区域/名单/窗口分钟/阈值
+./route_replay.py rollouts                    # 各组请求量/不可达/安全过渡拒绝
+./route_replay.py rollout-show RO-0001
+./route_replay.py rollout-promote RO-0001     # 一次性晋级（原子发布；重复→首次结果）
+./route_replay.py rollout-rollback RO-0001 "指标越界"   # 撤回（不动快照与代际）
+```
+
+## 镜像分发 CLI：mirror_cli.py（设备代理/发布，只读线上）
+
+```bash
+./mirror_cli.py publish RSU-01,RSU-02 "晚高峰推送"   # 生成不可变清单并分发（重试→首次结果）
+./mirror_cli.py publish RSU-03 --snapshot S-0001     # 从已固定行程快照生成清单
+./mirror_cli.py dispatch MF-0001 RSU-04              # 既有清单追加分发（逐盒判定一次）
+./mirror_cli.py manifests · tasks [RSU-01] · show MT-0001
+./mirror_cli.py pull MT-0001                          # 设备代理：拉块-校验-确认（断点续拉）
+./mirror_cli.py pull MT-0001 --stop-after 1           # 模拟拉 1 块后断网
+./mirror_cli.py pull MT-0001 --corrupt 1              # 模拟第 1 块传输损坏
+./mirror_cli.py switch MT-0001                        # 原子换指针（重复→首次切换结果）
+./mirror_cli.py devices · device RSU-01 · events
+```
+
+一键镜像演示：`bash demo_mirror.sh`（重置存储后走完整竞争/断网/损坏/切换流程）。
+自动化校验：`python3 test_mirror.py`（不可变清单/逐块与根散列验真/断网续拉幂等/
+单待切换镜像/较老代次与坏对象拒绝/原子换指针/重启恢复/同源隔离）。
+
+## 预热编排 CLI：preheat_cli.py（只读线上与镜像仓库）
+
+```bash
+./preheat_cli.py site SITE-A 1.6                  # 注册/调整站点共享带宽（KB/s）
+./preheat_cli.py box RSU-01 SITE-A 50 0.8         # 注册盒子：站点/磁盘MB/链路KB/s
+./preheat_cli.py submit MF-0001 RSU-01,RSU-02 120 0.8 2 "晚高峰预热"
+                          # 清单/目标盒/截止秒数/链路上限/最小在线保障（重试→首次作业）
+./preheat_cli.py queue                            # 排队次序/欠账/限速原因/预计完成
+./preheat_cli.py tick 5                           # 推进模拟时钟（传输前进、欠账累计）
+./preheat_cli.py link RSU-01 0.4                  # 链路降级/恢复（成对让路）
+./preheat_cli.py offline RSU-02 · online RSU-02   # 盒子上下线
+./preheat_cli.py pause PJ-0001 · resume PJ-0001   # 暂停（成对释放）· 恢复（只补剩余）
+./preheat_cli.py cancel PJ-0001                   # 取消（判定一次终身，成对释放）
+./preheat_cli.py board [RSU-01]                   # 待验收/已证明/隔离/修复中（与网页同源）
+./preheat_cli.py accept PT-0001                   # 盒端逐项验收 → 不可变证明/隔离+修复
+./preheat_cli.py corrupt PT-0001 chunk 2          # 注入缺陷：chunk|object|length|missing
+./preheat_cli.py corrupt PT-0001 object descriptor # 按对象注入（object=散列不符 / length=长度不符）
+./preheat_cli.py repair PT-0001                   # 创建/返回唯一修复（同键并发→首次任务）
+./preheat_cli.py repairs [PT-0001] · cancel-repair PR-0001
+./preheat_cli.py runs [RSU-01|PT-0001]            # 不可变验收记录与证明链（按盒/按任务）
+./preheat_cli.py summary [SITE-A] [MF-0001]       # 通过率/隔离容量/失败原因/修复统计
+./preheat_cli.py sites · boxes · jobs · show PJ-0001 · events
+```
+
+一键预热演示：`bash demo_preheat.sh`（重置存储后走完整调度/降级/暂停/复用/取消/重启流程）。
+自动化校验：`python3 test_preheat.py`（成对占用与站点带宽/盒内空间不变量/内容复用/
+欠账不饿死/暂停恢复只补剩余/降级离线取消崩溃无幽灵占用/重启重建/配额取消重提交确定结果/
+并发不突破配额/网页与 CLI 同源/隔离线上与镜像）；
+`python3 test_preheat_acceptance.py`（盒端逐项验收与不可变证明/仅证明可复用与可切换集合/
+缺块损坏只隔离受影响对象并释放空间/一次修复不重传已证明对象/同键并发返回首次任务/
+旧代次修复不覆盖新证明/离线重启取消可继续或收敛无残留/按站点×清单汇总与逐次结果追溯/
+不改清单地图镜像）。
+
+## 监管审计 CLI：audit_cli.py（只读线上）
+
+```bash
+./audit_cli.py template [import_key] [from] [to] [vehicle]   # 只读样例签名
+./audit_cli.py vehicle-events VH-01 EV-77                    # 只读：线上车辆→证据事件
+./audit_cli.py import events.json EV-77                      # 导入（同一键返回首次判定）
+./audit_cli.py append EV-77 more-events.json                 # 长链从持久检查点续算
+./audit_cli.py imports · show EV-77 · archives
+./audit_cli.py confirm EV-77 5 "审计确认点"
+./audit_cli.py query EV-77 5                    # 重建 seq=5 的版本/瓦片/步骤
+./audit_cli.py query EV-77 --ts 2026-10-03T09:54:37+00:00
+./audit_cli.py branch-switch EV-77 1 REL-0002  # 隔离演算：版本切换
+./audit_cli.py branch-revoke EV-77 5 P-0001    # 隔离演算：撤销道路管制
+./audit_cli.py branches EV-77 · branch B-0001
+./audit_cli.py export EV-77 audit-bundle.json  # 导出证据包
+```
+
+一键审计演示：`bash demo_audit.sh`（自动重置两个 store 并走完整流程）。
+自动化校验：`python3 test_audit.py`（覆盖四类拒绝、幂等、续算、两种分支、隔离保证）。
+一键试运行演示：`bash demo_rollout.sh`；自动化校验：`python3 test_rollout.py`
+（分组分流/三类统计/区域冲突/阈值闸门/晋级撤回幂等/原子性/重启恢复）。
+
+## 推荐演示路径（种子已备好两个候选）
+
+1. 打开地图审查：当前 `north=1/south=1`，4 条接缝全绿、C1/C2 走廊贯通。
+2. 点开 **RC-0003（v3-bad）**：南端口限速改 80 + 删西入口车道 → 接缝红点、
+   走廊 C1 断裂；点发布得到 422，版本纹丝不动（审计日志记 PUBLISH_REJECTED）。
+3. 校验并发布 **RC-0002（v2，内部新增车道、边界不变）**：north→第 2 代。
+4. 路线复现页为 VH-01 请求 `A00/w → B01/e`，固定 S-0001。
+5. 封路补丁页封闭 `A00/lce`（生成时给出经 B00 的绕行），激活。
+6. 回路线页：S-0001 仍是原版本；点"进入车道"后尝试"采用绕行"→ 被拒；
+   点"到达节点"后采用 → 生成子快照 S-0002（版本带 `+P-0001`，全程无车道中途拼接）。
+7. 撤销补丁：S-0002 历史复算仍封闭，新路线不再封闭；离线追赶一次性回放所有事件。
+
+## 文件
+
+```
+engine.py          领域引擎：拓扑图/Dijkstra、校验、发布、补丁、快照、试运行批次、原子持久化
+server.py          标准库 HTTP API + 静态文件
+route_replay.py    路线复现/生命周期/试运行 CLI
+mirror.py          路侧盒镜像引擎：不可变清单/压缩块/验真暂存/原子换指针（只读线上）
+mirror_cli.py      镜像分发 CLI（发布 + 设备代理拉取/确认/切换）
+preheat.py         预热编排引擎：共享带宽/盒内空间/内容复用调度、欠账公平、成对占用、盒端验收/不可变证明/隔离修复（只读线上与镜像）
+preheat_cli.py     预热编排 CLI（注册容量/提交作业/队列/推进/降级/暂停/取消/验收/修复/看板/汇总）
+audit.py           监管审计引擎：证据链导入/时序重建/检查点/隔离分支/导出（只读线上）
+audit_cli.py       审计 CLI（导入/查询/检查点/分支/导出）
+test_mirror.py     镜像仓库端到端校验（验真/续拉/竞争/原子切换/重启/隔离）
+test_preheat.py    预热编排端到端校验（不变量/复用/公平/恢复/确定性/并发/同源/隔离）
+test_preheat_acceptance.py 盒端验收与隔离修复端到端校验（逐项证明/只隔离受影响对象/一次修复/并发同键/旧代次不覆盖/重启取消收敛/汇总追溯）
+test_audit.py      审计需求端到端校验（可重复运行）
+test_rollout.py    分组试运行端到端校验（分流/统计/冲突/幂等/原子性/重启恢复）
+demo_mirror.sh     镜像分发一键演示
+demo_preheat.sh    预热编排一键演示
+demo_audit.sh      审计功能一键演示
+demo_rollout.sh    分组试运行一键演示
+static/            审查页（index.html / app.js / styles.css，含 🧪 分组试运行、📦 镜像分发、🔥 预热编排 与 ⚖ 时序审计 标签页）
+data/mapstate.json 线上单一事实源（原子落盘；审计、镜像与预热从不写入）
+data/audit.json    审计 append-only 存储（imports/checkpoints/branches/exports/archives）
+data/mirror.json   镜像仓库存储（manifests/chunk_store/tasks/devices/events）
+data/preheat.json  预热编排存储（模拟时钟/sites/boxes[proven/chunk_holds]/jobs/tasks/acceptances/proofs/repairs/events）
+```
+
+## 镜像子系统的隔离不变量
+
+- **物理分离**：镜像状态全部在独立的 `data/mirror.json`；`mirror.py` 只以深拷贝方式
+  读取线上 `MapEngine.state`（持锁快照），清单生成后线上任何演进都不影响已生成清单。
+- **清单不可变**：清单内容（来源版本/对象/压缩块/根散列/设备集合）整体做内容寻址；
+  相同内容重复提交永远返回首次清单与首次任务（响应带 `idempotent:true`）。
+- **判定一次终身**：任务按 `(清单散列, 设备)` 幂等；接受/拒绝、切换成功/失败都是
+  首次判定永久有效，重试同一清单返回第一次任务和切换结果。
+- **验真才暂存、验真才切换**：逐块 `sha256` + 整包根散列复核通过才进入"可切换"；
+  切换动作在同一原子提交内再次全量验真并换指针，任何一步失败盒子保持原镜像。
+
+## 预热编排子系统的隔离不变量
+
+- **物理分离**：编排状态全部在独立的 `data/preheat.json`；`preheat.py` 只读镜像清单
+  （不可变内容寻址），从不写 `mapstate.json` / `mirror.json`，已生效地图与行程快照不受任何影响。
+- **成对占用**：磁盘预留与传输名额只存在于 `transferring` 任务上，且由每次原子提交内的
+  统一结算（settle）成对取得/释放；任何终结态（完成/取消/暂停/离线/降级/崩溃恢复）
+  都不会残留预留。占用量永远 = Σ 传输中任务的预留，无幽灵占用的构造性保证。
+- **容量不破**：站点授予速率之和 ≤ 站点容量、盒子 已用+预留 ≤ 磁盘总量，
+  两条不变量在每次提交后成立（`check_invariants` 可自检），并发操作经单锁 + 原子落盘串行化。
+- **公平不饿死**：合格却未获足额带宽的任务按 tick 累计欠账并随存储落盘；
+  调度按（欠账↓ · 截止↑ · 提交序↑）服务，欠账无界增长 ⇒ 任何持续合格的作业终将获得名额。
+- **确定结果**：相同内容重复提交返回首次作业（幂等键含清单散列/目标/截止/上限/保障/备注；
+  首次作业已取消则确定性新建）；取消判定一次终身，重复取消返回首次结果。
+- **重启重建**：模拟时钟、欠账、已传字节全部落盘；重启时传输中任务成对释放并重新排队，
+  队列次序、欠账与剩余时长由同一纯调度函数重建，网页与 CLI 看到完全一致的结果。
+- **验收才可信**：传输完成只进入"待验收"，盒端逐项验证长度/对象散列/块散列/根散列后
+  才写不可变证明（含清单代次、作业编号、盒内验收序号，摘要按父证明串链）；只有证明
+  有效的对象进入盒上 proven 地图，复用计算与**可切换集合**只认 proven——未证明内容
+  传输再多也不参与复用，也不能切换。
+- **只隔离受影响对象**：缺块/损坏按块隔离块内对象、立即释放该块对应空间（盒上块持有
+  记录跨任务去重取得/释放，绝不双释放），已证明对象与其块原样保留；修复严格限定为
+  隔离对象所在的剩余块，已证明对象永不重传。
+- **修复唯一且按代次收敛**：修复键 `(任务, 隔离代次, 剩余块集合)`，并发提交返回首次
+  任务；修复完成自动重新验收；父任务进入新代次（新证明）后，旧代次开放修复立即
+  `superseded`，即使晚完成也不触碰新证明。离线/重启/取消后修复成对释放、可续作，
+  取消作业会释放全部未证明空间并取消其修复，容量账恒平（`check_invariants` 自检）。
+- **记录不可变、结果可追溯**：验收 run 与逐对象 proof 只追加不改写；每次验收与修复
+  都留下确定结果（原因码/释放字节/收敛 run），可按站点×清单汇总通过率、隔离容量与
+  失败原因；整个过程不修改原清单、已生效地图、行程快照或镜像仓库。
+
+## 审计子系统的隔离不变量
+
+- **物理分离**：审计状态全部在独立的 `data/audit.json`；`audit.py` 只以深拷贝方式
+  读取线上 `MapEngine.state`（持锁快照），从不调用任何线上写方法，也不实例化/修改线上代际。
+- **证据链不可变**：导入即校验 `序号连续 / 无重复 / 摘要匹配 / 父链完整 / 事件语义`；
+  被拒导入也留档（`import_rejected` 档案），但不进入证据链。续算的坏批次只记
+  `append_rejected`，头部检查点与原链保持不动。
+- **判定唯一**：同一 `import_key` 无论再提交什么都返回第一次的判定。
+- **只读时序查询**：重建只在内容寻址瓦片库上复核 `sha256(tile)` 与版本描述哈希；
+  篡改以 `tile_digest_mismatch / descriptor_hash_mismatch` 预警呈现，不影响查询出证。
+- **分支即档案**：每个分支固定在一个已确认检查点，只演算一次假设；版本切换只允许指向
+  **已发布**的 release，撤销管制只允许撤销该时刻版本中实际固定的补丁；结果含
+  与该版本的瓦片/代际/路径差异。分支永远不写线上。
+- **查询/分支/导出都产生新档案**：`A-####` 审计档案 append-only，`result_digest`
+  固化每次出证内容；导出包整体再算一个 `bundle_digest`。
