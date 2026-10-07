@@ -700,6 +700,42 @@ class EdgeCastEngine:
                     "first_result": {"buffered": True, "seq": seq}}
         return None
 
+    def _exact_verdict(self, b: dict, payload: dict, body_hash: str):
+        """在指定批次中查找该回执**精确正文**（同设备/同代次/同序号且正文摘要
+        相同）的首次判定；仅精确匹配才返回结果，不同正文返回 None——跨批次的
+        同号不同正文不算冲突（各批次序号命名空间独立）。只读：不追加事件、
+        不改变任何状态。用于旧批次重放识别：旧批次回执永远返回旧批次首次判定。"""
+        device_id = payload["device_id"]
+        attempt, seq = payload["attempt"], payload["seq"]
+        dev = b["devices"].get(device_id)
+        if dev is None:
+            return None
+        ast = dev["attempt_state"].get(str(attempt))
+        if ast is None:
+            return None
+        prev = ast["processed"].get(str(seq))
+        if prev is not None and prev["body_hash"] == body_hash:
+            return {"accepted": True, "idempotent": True, "duplicate": True,
+                    "batch_id": b["batch_id"], "device_id": device_id,
+                    "attempt": attempt, "seq": seq,
+                    "stale_attempt": attempt != dev["attempt"],
+                    "first_result": self._first_result(ast, str(seq))}
+        rej = ast.get("rejected", {}).get(str(seq))
+        if rej is not None and rej["body_hash"] == body_hash:
+            return {"accepted": False, "idempotent": True, "duplicate": True,
+                    "rejection": {"code": rej["code"],
+                                  "message": rej["message"]},
+                    "batch_id": b["batch_id"], "device_id": device_id,
+                    "attempt": attempt, "seq": seq,
+                    "first_result": rej.get("first_result")}
+        buf = ast["buffered"].get(str(seq))
+        if buf is not None and buf["hash"] == body_hash:
+            return {"accepted": True, "idempotent": True, "duplicate": True,
+                    "buffered": True, "batch_id": b["batch_id"],
+                    "device_id": device_id, "attempt": attempt, "seq": seq,
+                    "first_result": {"buffered": True, "seq": seq}}
+        return None
+
     def ingest_receipt(self, body: dict) -> dict:
         """设备回执独立入口。返回首次确定结果；重复调用返回同一结果。"""
         with self.lock:
@@ -738,8 +774,19 @@ class EdgeCastEngine:
                     f"回执版本 {payload['package_version']} 与批次版本 "
                     f"{b['package_version']} 不一致", batch_id=b["batch_id"])
 
-            # 2) 已处理 / 已判定拒绝的回执，无论批次状态 / 代次新旧，重复即返回
-            #    首次结果；同号不同正文永久冲突（必须早于批次状态闸门）。
+            # 2) 重复即返回首次判定（必须早于批次状态闸门）：
+            #    a. 跨批次精确重放——同一设备同一包的**其他**批次（通常是已完成/
+            #       已撤销的旧批次）已处理/暂存/判定过完全相同的正文 → 该回执
+            #       属于旧批次，返回旧批次的首次判定，不触碰当前批次任何状态
+            #       （不计票、不留痕）。同号不同正文不算跨批次冲突：各批次序号
+            #       命名空间相互独立，新批次自己的回执仍走下方正常受理流程。
+            for other in matches:
+                if other is b:
+                    continue
+                replay = self._exact_verdict(other, payload, body_hash)
+                if replay is not None:
+                    return replay
+            #    b. 当前批次自身的同号去重：重复回首次结果，同号不同正文永久冲突。
             dup = self._dup_verdict(b, payload, body_hash)
             if dup is not None:
                 return dup

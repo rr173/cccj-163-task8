@@ -194,6 +194,46 @@ class Case(unittest.TestCase):
         self.send("D1", 3, "success")
         self.assertEqual(self.eng.batch_view(bid)["devices"]["D1"]["votes"], 1)
 
+    def test_02c_cross_batch_replay_returns_old_batch_verdict(self):
+        # 同一设备同一地图包：旧批次完成后立即创建同包新批次
+        bid1 = self.new_batch(devices=("D1",), cap=1, threshold=1)
+        self.assertTrue(self.send("D1", 1, "success")["terminal"])
+        self.assertEqual(self.eng.batch_view(bid1)["status"], "completed")
+        bid2 = self.new_batch(devices=("D1",), cap=1, threshold=1)
+        self.assertEqual(self.inflight(bid2), 1)
+
+        # 重发旧批次已处理的终态回执 → 返回旧批次首次判定，新批次状态不变
+        dup = self.send("D1", 1, "success")
+        self.assertTrue(dup["duplicate"] and dup["idempotent"])
+        self.assertEqual(dup["batch_id"], bid1)
+        self.assertEqual(dup["first_result"]["status"], "success")
+        b2 = self.eng.batch_view(bid2)
+        self.assertEqual(b2["devices"]["D1"]["votes"], 0)
+        self.assertEqual(b2["devices"]["D1"]["status"], "inflight")
+        self.assertEqual(b2["counts"]["succeeded"], 0)
+        self.assertEqual(b2["status"], "active")
+
+        # 新批次自己的回执仍正常受理（不同正文：进度回执 + 终态回执）
+        r1 = self.send("D1", 1, "received")
+        self.assertTrue(r1["accepted"] and not r1["duplicate"])
+        self.assertTrue(self.send("D1", 2, "success")["terminal"])
+        b2 = self.eng.batch_view(bid2)
+        self.assertEqual(b2["devices"]["D1"]["votes"], 1)
+        self.assertEqual(b2["status"], "completed")
+
+        # 重启后：旧批次重放仍回旧批次首次判定且不触碰新批次；
+        # 新批次自己的重复回执仍回新批次首次判定
+        self.reopen()
+        dup2 = self.send("D1", 1, "success")
+        self.assertTrue(dup2["duplicate"])
+        self.assertEqual(dup2["batch_id"], bid1)
+        nb2 = self.eng.batch_view(bid2)
+        self.assertEqual(nb2["devices"]["D1"]["votes"], 1)
+        self.assertEqual(nb2["counts"]["succeeded"], 1)
+        own = self.send("D1", 2, "success")
+        self.assertTrue(own["duplicate"])
+        self.assertEqual(own["batch_id"], bid2)
+
     # ========================================================= 3. 乱序回执 ==
     def test_03_out_of_order_buffered_then_drained(self):
         bid = self.new_batch(devices=("D1",), cap=1, threshold=1)
